@@ -1366,6 +1366,7 @@ impl StreamTx {
         self.queue_info = None;
         self.rtx_cache.clear();
         self.resends.clear();
+        self.recent_resends.clear();
         self.padding = 0;
     }
 
@@ -1475,6 +1476,63 @@ mod test {
             assert_eq!(header.ext_vals.transport_cc, Some(42));
             assert!(header.ssrc.is_probe());
             assert!(header.has_padding);
+        }
+    }
+
+    #[test]
+    fn resend_history_is_retired_with_reset_buffers_and_ssrc() {
+        let start = Instant::now();
+        let codecs = CodecConfig::new_with_defaults();
+        let pt = codecs
+            .params()
+            .iter()
+            .find(|p| p.resend().is_some())
+            .unwrap()
+            .pt();
+        let exts = ExtensionMap::standard();
+        for change_ssrc in [false, true] {
+            let mut streams =
+                crate::streams::Streams::new(false, 1200, Duration::from_millis(1500));
+            let stream =
+                streams.declare_stream_tx(42.into(), Some(44.into()), MidRid("vid".into(), None));
+            stream.set_rtx_cache(100, Duration::from_secs(3), None);
+            let mut buf = Vec::new();
+            stream
+                .write_rtp(RtpWrite::new(pt, 3.into(), 0, start, vec![1_u8; 1000]).nackable(true));
+            stream.send_queue.handle_timeout(start);
+            stream
+                .poll_packet(start, &exts, None, codecs.params(), &mut buf)
+                .unwrap();
+            let resent_at = start + Duration::from_millis(10);
+            stream.handle_nack([NackEntry { pid: 3, blp: 0 }].into_iter(), resent_at);
+            let old_repair = stream
+                .poll_packet(resent_at, &exts, None, codecs.params(), &mut buf)
+                .unwrap();
+            assert_eq!(old_repair.header.ssrc, 44.into());
+            if change_ssrc {
+                stream.reset_ssrc(46.into(), Some(48.into()));
+            } else {
+                stream.reset_buffers();
+            }
+            let now = resent_at + Duration::from_millis(10);
+            stream.write_rtp(RtpWrite::new(pt, 3.into(), 0, now, vec![2_u8; 1000]).nackable(true));
+            stream.send_queue.handle_timeout(now);
+            let original = stream
+                .poll_packet(now, &exts, None, codecs.params(), &mut buf)
+                .unwrap();
+            assert_eq!(
+                original.header.ssrc,
+                if change_ssrc { 46.into() } else { 42.into() }
+            );
+            stream.handle_nack([NackEntry { pid: 3, blp: 0 }].into_iter(), now);
+            let repair = stream.poll_packet(now, &exts, None, codecs.params(), &mut buf);
+            assert!(
+                repair
+                    .as_ref()
+                    .is_some_and(|packet| packet.header.ssrc
+                        == if change_ssrc { 48.into() } else { 44.into() }),
+                "reset must retire resend history (changed SSRC: {change_ssrc})"
+            );
         }
     }
 
