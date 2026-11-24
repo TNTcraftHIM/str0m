@@ -9,7 +9,7 @@ use str0m_proto::Id;
 use str0m_proto::Pii;
 
 // When running ice-lite we need a cutoff when we consider the remote definitely gone.
-const RECENT_BINDING_REQUEST: Duration = Duration::from_secs(15);
+pub(crate) const RECENT_BINDING_REQUEST: Duration = Duration::from_secs(15);
 
 /// A pair of candidates, local and remote, in the ice agent.
 pub struct CandidatePair {
@@ -33,6 +33,7 @@ pub struct CandidatePair {
     /// Current state of this pair. Start in Waiting (there is
     /// no frozen state since there is only one data stream).
     state: CheckState,
+    pub(crate) withdrawn: bool,
 
     /// Record of the latest STUN messages we've tried using this pair.
     ///
@@ -63,6 +64,8 @@ pub struct CandidatePair {
     /// Sum of all RTTs measured from successful STUN binding transactions
     /// on this pair, across the whole pair lifetime.
     total_round_trip_time: Duration,
+    last_response: Option<Instant>,
+    last_rtt: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -160,6 +163,7 @@ impl CandidatePair {
             id: Default::default(),
             valid_idx: Default::default(),
             state: Default::default(),
+            withdrawn: false,
             cached_next_attempt_time: Default::default(),
             remote_binding_requests: Default::default(),
             remote_binding_request_time: Default::default(),
@@ -167,6 +171,8 @@ impl CandidatePair {
             nomination_state: Default::default(),
             responses_received: 0,
             total_round_trip_time: Duration::ZERO,
+            last_response: None,
+            last_rtt: None,
         }
     }
 
@@ -219,6 +225,12 @@ impl CandidatePair {
         self.state
     }
 
+    pub(crate) fn withdraw(&mut self) {
+        self.withdrawn = true;
+        self.binding_attempts.clear();
+        self.cached_next_attempt_time = None;
+    }
+
     pub fn increase_remote_binding_requests(&mut self, now: Instant) {
         self.remote_binding_requests += 1;
         self.remote_binding_request_time = Some(now);
@@ -238,6 +250,9 @@ impl CandidatePair {
     }
 
     pub fn is_ice_lite_alive(&self, now: Instant) -> bool {
+        if self.withdrawn {
+            return false;
+        }
         let Some(t) = self.remote_binding_request_time else {
             return true; // No timestamp yet = hasn't had a chance to fail
         };
@@ -260,6 +275,8 @@ impl CandidatePair {
     }
 
     pub fn copy_nominated_and_success_state(&mut self, other: &CandidatePair) {
+        self.last_response = other.last_response;
+        self.last_rtt = other.last_rtt;
         match other.nomination_state {
             NominationState::Nominated | NominationState::Success => {
                 self.nomination_state = other.nomination_state;
@@ -336,7 +353,15 @@ impl CandidatePair {
     pub fn binding_attempt(&self, trans_id: TransId) -> Option<&BindingAttempt> {
         self.binding_attempts
             .iter()
-            .find(|b| b.trans_id == trans_id)
+            .find(|b| b.trans_id == trans_id && b.respone_recv.is_none())
+    }
+
+    pub fn take_failed_attempt(&mut self, trans_id: TransId) -> Option<BindingAttempt> {
+        let index = self
+            .binding_attempts
+            .iter()
+            .position(|attempt| attempt.trans_id == trans_id && attempt.respone_recv.is_none())?;
+        self.binding_attempts.remove(index)
     }
 
     /// Marks a binding request attempt as having a successful response.
@@ -344,7 +369,12 @@ impl CandidatePair {
     /// ### Panics
     ///
     /// Panics if the trans_id doesn't belong to this pair.
-    pub fn record_binding_response(&mut self, now: Instant, trans_id: TransId, valid_idx: usize) {
+    pub fn record_binding_response(
+        &mut self,
+        now: Instant,
+        trans_id: TransId,
+        valid_idx: usize,
+    ) -> bool {
         self.cached_next_attempt_time = None;
 
         self.valid_idx = Some(valid_idx);
@@ -355,7 +385,12 @@ impl CandidatePair {
             .find(|b| b.trans_id == trans_id)
             .expect("Binding request attempt");
 
+        if attempt.respone_recv.is_some() {
+            return false;
+        }
         attempt.respone_recv = Some(now);
+        self.last_response = Some(now);
+        self.last_rtt = Some(now.saturating_duration_since(attempt.request_sent));
 
         self.responses_received += 1;
         self.total_round_trip_time += now - attempt.request_sent;
@@ -375,6 +410,7 @@ impl CandidatePair {
         }
 
         trace!("Recorded binding response: {:?}", self);
+        true
     }
 
     /// Marks the pair as validated by an incoming binding request we answered.
@@ -414,10 +450,22 @@ impl CandidatePair {
     ///
     /// `None` if no binding response has been received yet.
     pub fn last_successful_rtt(&self) -> Option<Duration> {
-        self.binding_attempts
-            .iter()
-            .rev()
-            .find_map(|b| b.respone_recv.map(|r| r - b.request_sent))
+        self.last_rtt
+    }
+
+    pub(crate) fn last_response(&self) -> Option<Instant> {
+        self.last_response
+    }
+
+    pub(crate) fn nomination_complete(&self) -> bool {
+        self.nomination_state == NominationState::Success
+    }
+
+    pub(crate) fn record_consent_response(&mut self, now: Instant, rtt: Duration) {
+        self.last_response = Some(now);
+        self.last_rtt = Some(rtt);
+        self.responses_received += 1;
+        self.total_round_trip_time += rtt;
     }
 
     /// Total number of STUN binding responses received on this pair over
@@ -487,6 +535,10 @@ impl CandidatePair {
     ///
     /// Returns `false` if the candidate has failed.
     pub fn is_still_possible(&self, now: Instant, timing_config: &StunTiming) -> bool {
+        if self.withdrawn {
+            return false;
+        }
+
         // If we've recently received a binding request from the remote peer, the pair
         // is still viable even if our own binding requests aren't getting responses.
         // This handles the case where the remote peer is still sending us requests
@@ -496,6 +548,13 @@ impl CandidatePair {
             if now - t < RECENT_BINDING_REQUEST {
                 return true;
             }
+        }
+
+        if self
+            .last_response
+            .is_some_and(|at| now.saturating_duration_since(at) >= timing_config.timeout())
+        {
+            return false;
         }
 
         let attempts = self.binding_attempts.len();

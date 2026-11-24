@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::Sha1HmacProvider;
+use crate::consent::{ActiveConsent, EXPIRY, Tuple};
 use crate::preference::default_local_preference;
 use crate::stun::{Class as StunClass, Method as StunMethod, StunTiming};
 use crate::stun::{StunMessage, StunPacket, TransId};
@@ -95,6 +96,9 @@ pub struct IceAgent {
     /// Currently nominated pair for sending. This is used to evaluate
     /// if we get a better candidate for [`IceAgentEvent::NominatedSend`].
     nominated_send: Option<PairId>,
+    active_consent: Option<ActiveConsent>,
+    retired: HashSet<Tuple>,
+    retired_credentials: Option<(IceCreds, IceCreds)>,
 
     /// Statistics counter for the agent.
     stats: IceAgentStats,
@@ -355,6 +359,9 @@ impl IceAgent {
             stun_server_queue: VecDeque::new(),
             discovered_recv: HashSet::new(),
             nominated_send: None,
+            active_consent: None,
+            retired: HashSet::new(),
+            retired_credentials: None,
             stats: IceAgentStats::default(),
             timing_advance: Duration::from_millis(50),
             timing_config: StunTiming::default(),
@@ -429,6 +436,12 @@ impl IceAgent {
         if self.local_credentials != r {
             debug!("Set local credentials: {:?}", Pii(&r));
             self.local_credentials = r;
+            self.reset_retired_generation();
+            if !self.candidate_pairs.is_empty() {
+                self.candidate_pairs.clear();
+                self.nominated_send = None;
+                self.recreate_candidate_pairs();
+            }
         }
     }
 
@@ -541,7 +554,14 @@ impl IceAgent {
     pub fn set_remote_credentials(&mut self, r: IceCreds) {
         if self.remote_credentials.as_ref() != Some(&r) {
             debug!("Set remote credentials: {:?}", Pii(&r));
+            let replacing = self.remote_credentials.is_some();
             self.remote_credentials = Some(r);
+            self.reset_retired_generation();
+            if replacing {
+                self.candidate_pairs.clear();
+                self.nominated_send = None;
+                self.recreate_candidate_pairs();
+            }
         }
     }
 
@@ -855,6 +875,13 @@ impl IceAgent {
                 let local = &self.local_candidates[*local_idx];
                 let remote = &self.remote_candidates[*remote_idx];
 
+                if self
+                    .retired
+                    .contains(&(local.proto(), local.base(), remote.addr()))
+                {
+                    continue;
+                }
+
                 // Candidates in a pair must share the same protocol
                 if local.proto() != remote.proto() {
                     continue 'outer;
@@ -883,6 +910,11 @@ impl IceAgent {
                         && remote.proto() == check_remote.proto();
 
                     if redundant {
+                        if check.withdrawn {
+                            pair.copy_nominated_and_success_state(check);
+                            self.candidate_pairs[check_idx] = pair;
+                            continue 'outer;
+                        }
                         if check.prio() >= pair.prio() {
                             // skip this new pair since there is a redundant pair already in the
                             // list with higher/equal priority.
@@ -942,8 +974,15 @@ impl IceAgent {
             self.has_exceeded_max_candidate_pairs = true;
         }
 
-        while self.candidate_pairs.len() > max {
-            let pair = self.candidate_pairs.pop();
+        while self.consent_slots() > max {
+            let Some(index) = self
+                .candidate_pairs
+                .iter()
+                .rposition(|pair| pair.last_response().is_none())
+            else {
+                break;
+            };
+            let pair = Some(self.candidate_pairs.remove(index));
             debug!("Remove overflow pair {:?}", Pii(&pair));
         }
     }
@@ -969,6 +1008,7 @@ impl IceAgent {
                 debug!("Local candidate to discard {:?}", Pii(&other));
                 other.set_discarded(true);
                 self.discard_candidate_pairs_by_local(idx);
+                self.candidates_changed();
                 return true;
             }
         }
@@ -989,12 +1029,20 @@ impl IceAgent {
                 debug!("Remote candidate to discard {:?}", Pii(&other));
                 other.set_discarded(true);
                 self.discard_candidate_pairs_by_remote(idx);
+                self.candidates_changed();
                 return true;
             }
         }
 
         debug!("No local or remote candidate found: {:?}", Pii(&c));
         false
+    }
+
+    fn candidates_changed(&mut self) {
+        if let Some(now) = self.last_now {
+            self.evaluate_nomination(now);
+            self.evaluate_state(now);
+        }
     }
 
     /// Restart ICE.
@@ -1012,6 +1060,14 @@ impl IceAgent {
         // data can continue to be sent using existing data sessions, and a new
         // data session always requires the roles to be determined.
 
+        if self
+            .active_consent
+            .as_ref()
+            .is_some_and(|active| self.last_now.is_some_and(|now| active.expired(now)))
+        {
+            self.active_consent = None;
+        }
+        self.nominated_send = None;
         self.remote_credentials = None;
         self.remote_candidates.clear();
         self.candidate_pairs.clear();
@@ -1040,7 +1096,8 @@ impl IceAgent {
     ///
     /// This is similar to an ICE restart but also retains all remote candidates.
     pub fn recreate_candidate_pairs(&mut self) {
-        self.candidate_pairs.clear();
+        self.candidate_pairs
+            .retain(|pair| pair.last_response().is_some());
 
         let local_idxs: Vec<_> = self
             .local_candidates
@@ -1064,13 +1121,47 @@ impl IceAgent {
     /// Discard candidate pairs that contain the candidate identified by a local index.
     fn discard_candidate_pairs_by_local(&mut self, local_idx: usize) {
         trace!("Discard pairs for local candidate index: {:?}", local_idx);
-        self.candidate_pairs.retain(|c| c.local_idx() != local_idx);
+        let local = &self.local_candidates[local_idx];
+        self.transmit
+            .retain(|packet| packet.proto != local.proto() || packet.source != local.base());
+        if let Some(active) = self.active_consent.as_mut() {
+            if active.proto == local.proto() && active.source == local.base() {
+                active.withdraw();
+                self.nominated_send = None;
+            }
+        }
+        self.candidate_pairs.retain_mut(|pair| {
+            if pair.local_idx() != local_idx {
+                return true;
+            }
+            pair.withdraw();
+            pair.last_response().is_some()
+        });
     }
 
     /// Discard candidate pairs that contain the candidate identified by a remote index.
     fn discard_candidate_pairs_by_remote(&mut self, remote: usize) {
         trace!("Discard pairs for remote candidate index: {:?}", remote);
-        self.candidate_pairs.retain(|c| c.remote_idx() != remote);
+        let remote_candidate = &self.remote_candidates[remote];
+        self.transmit.retain(|packet| {
+            packet.proto != remote_candidate.proto()
+                || packet.destination != remote_candidate.addr()
+        });
+        if let Some(active) = self.active_consent.as_mut() {
+            if active.proto == remote_candidate.proto()
+                && active.destination == remote_candidate.addr()
+            {
+                active.withdraw();
+                self.nominated_send = None;
+            }
+        }
+        self.candidate_pairs.retain_mut(|pair| {
+            if pair.remote_idx() != remote {
+                return true;
+            }
+            pair.withdraw();
+            pair.last_response().is_some()
+        });
     }
 
     /// Tells whether the message is for this agent instance.
@@ -1080,6 +1171,14 @@ impl IceAgent {
     /// For binding requests, if no remote credentials have been set using
     /// `set_remote_credentials`, the remote ufrag is not checked.
     pub fn accepts_message(&self, message: &StunMessage<'_>) -> bool {
+        self.accepts_current_message(message)
+            || self
+                .active_consent
+                .as_ref()
+                .is_some_and(|active| active.accepts(message, self.sha1_hmac_provider))
+    }
+
+    fn accepts_current_message(&self, message: &StunMessage<'_>) -> bool {
         trace!("Check if accepts message: {:?}", message);
 
         let sha1_hmac =
@@ -1182,6 +1281,8 @@ impl IceAgent {
     pub fn handle_packet(&mut self, now: Instant, packet: StunPacket) -> bool {
         trace!("Handle receive: {:?}", &packet.message);
 
+        self.expire_consents(now);
+
         // We can't reply to such an address, nor use it as a peer-reflexive candidate.
         if !is_valid_peer_addr(packet.source) {
             debug!(
@@ -1193,9 +1294,103 @@ impl IceAgent {
 
         // Regardless of whether we have remote_creds at this point, we can
         // at least check the message integrity.
-        if !self.accepts_message(&packet.message) {
+        let current_message = self.accepts_current_message(&packet.message);
+        if !current_message
+            && !self
+                .active_consent
+                .as_ref()
+                .is_some_and(|active| active.accepts(&packet.message, self.sha1_hmac_provider))
+        {
             debug!("Message not accepted");
             return false;
+        }
+
+        let mtu = self.mtu();
+        let active_packet = self
+            .active_consent
+            .as_ref()
+            .is_some_and(|active| active.accepts_packet(&packet, self.sha1_hmac_provider));
+        if active_packet {
+            if !packet.message.is_binding_request() {
+                let response = self
+                    .active_consent
+                    .as_mut()
+                    .unwrap()
+                    .take_response(now, &packet.message);
+                if let Some((rtt, role)) = response {
+                    match packet.message.error_code().map(|(code, _)| code) {
+                        Some(403) => {
+                            let tuple = self.active_consent.as_ref().unwrap().tuple();
+                            self.retire_active(tuple);
+                        }
+                        Some(487) => self.handle_role_conflict_response(role),
+                        None if packet.message.is_successful_binding_response() => {
+                            self.active_consent.as_mut().unwrap().renew(now);
+                            self.stats.bind_success_recv += 1;
+                            if let Some(pair) = self
+                                .candidate_pairs
+                                .iter_mut()
+                                .find(|pair| Some(pair.id()) == self.nominated_send)
+                            {
+                                pair.record_consent_response(now, rtt);
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.evaluate_nomination(now);
+                    self.evaluate_state(now);
+                }
+                return true;
+            }
+            self.active_consent.as_mut().unwrap().received_request(now);
+            let old_generation = self.remote_credentials.as_ref().is_none_or(|remote| {
+                !self
+                    .active_consent
+                    .as_ref()
+                    .unwrap()
+                    .same_generation(&self.local_credentials, remote)
+            });
+            if old_generation {
+                let peer_role = if self.controlling {
+                    packet.message.ice_controlling()
+                } else {
+                    packet.message.ice_controlled()
+                };
+                let conflict = self.resolve_role_conflict(peer_role);
+                let active = self.active_consent.as_ref().unwrap();
+                if !active.withdrawn {
+                    self.transmit.push_back(active.reply(
+                        &packet,
+                        self.sha1_hmac_provider,
+                        mtu,
+                        conflict,
+                    ));
+                }
+                return true;
+            }
+        }
+
+        // Old credentials authorize only the retained transport handled above.
+        if !current_message
+            || self
+                .retired
+                .contains(&(packet.proto, packet.destination, packet.source))
+        {
+            return false;
+        }
+
+        if !packet.message.is_binding_request() {
+            let exact_pair = self.candidate_pairs.iter().any(|pair| {
+                let local = pair.local_candidate(&self.local_candidates);
+                let remote = pair.remote_candidate(&self.remote_candidates);
+                pair.binding_attempt(packet.message.trans_id()).is_some()
+                    && local.proto() == packet.proto
+                    && local.base() == packet.destination
+                    && remote.addr() == packet.source
+            });
+            if !exact_pair {
+                return false;
+            }
         }
 
         if packet.message.is_binding_request() {
@@ -1221,6 +1416,7 @@ impl IceAgent {
     /// Typically, you will want to call [`IceAgent::poll_timeout`] and "wake-up"
     /// the agent once that time is reached.
     pub fn handle_timeout(&mut self, now: Instant) {
+        self.expire_consents(now);
         // This happens exactly once because evaluate_state() below will
         // switch away from New -> Checking.
         if self.state == IceConnectionState::New {
@@ -1228,6 +1424,20 @@ impl IceAgent {
         }
 
         self.evaluate_state(now);
+
+        let mtu = self.mtu();
+        if let Some(active) = self.active_consent.as_mut() {
+            if let Some(check) = active.poll_check(
+                now,
+                self.sha1_hmac_provider,
+                mtu,
+                self.controlling,
+                self.control_tie_breaker,
+            ) {
+                self.stats.bind_request_sent += 1;
+                self.transmit.push_back(check);
+            }
+        }
 
         // First we try to empty the queue of saved STUN requests.
         if self.remote_credentials.is_some() {
@@ -1260,7 +1470,7 @@ impl IceAgent {
             let keep = if self.ice_lite {
                 p.is_ice_lite_alive(now)
             } else {
-                p.is_still_possible(now, &self.timing_config)
+                p.last_response().is_some() || p.is_still_possible(now, &self.timing_config)
             };
             if !keep {
                 debug!("Remove failed pair: {:?}", Pii(&p));
@@ -1268,6 +1478,14 @@ impl IceAgent {
             }
             keep
         });
+        if self.ice_lite
+            && self
+                .nominated_send
+                .is_some_and(|id| !self.candidate_pairs.iter().any(|pair| pair.id() == id))
+        {
+            self.active_consent = None;
+            self.nominated_send = None;
+        }
         if any_pruned {
             self.evaluate_nomination(now);
             self.evaluate_state(now);
@@ -1298,6 +1516,9 @@ impl IceAgent {
             .candidate_pairs
             .iter_mut()
             .enumerate()
+            .filter(|(_, c)| {
+                !c.withdrawn && (Some(c.id()) != self.nominated_send || !c.nomination_complete())
+            })
             .map(|(i, c)| (i, c.next_binding_attempt(now, &self.timing_config)))
             .min_by_key(|(_, t)| *t);
 
@@ -1349,6 +1570,10 @@ impl IceAgent {
         } else {
             self.candidate_pairs
                 .iter_mut()
+                .filter(|c| {
+                    !c.withdrawn
+                        && (Some(c.id()) != self.nominated_send || !c.nomination_complete())
+                })
                 .map(|c| c.next_binding_attempt(last_now, &self.timing_config))
                 .min()
         };
@@ -1371,7 +1596,130 @@ impl IceAgent {
         } else {
             next
         };
-        Some(next)
+        let selected = self.current_consent_tuple();
+        let consent_at = self
+            .candidate_pairs
+            .iter()
+            .filter(|pair| Some(self.pair_tuple(pair)) != selected)
+            .filter_map(|pair| pair.last_response().map(|at| at + EXPIRY))
+            .min();
+        let next = consent_at.map_or(next, |at| next.min(at));
+        Some(
+            self.active_consent
+                .as_ref()
+                .and_then(|active| active.timeout())
+                .map_or(next, |at| next.min(at)),
+        )
+    }
+
+    /// Permission to send application data on the exact selected transport.
+    pub fn can_send(
+        &self,
+        now: Instant,
+        proto: Protocol,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> bool {
+        self.active_consent.as_ref().is_some_and(|active| {
+            active.matches(proto, source, destination) && !active.expired(now) && !active.withdrawn
+        })
+    }
+
+    fn pair_tuple(&self, pair: &CandidatePair) -> Tuple {
+        let local = pair.local_candidate(&self.local_candidates);
+        (
+            local.proto(),
+            local.base(),
+            pair.remote_candidate(&self.remote_candidates).addr(),
+        )
+    }
+
+    fn current_consent_tuple(&self) -> Option<Tuple> {
+        let active = self.active_consent.as_ref()?;
+        active
+            .same_generation(&self.local_credentials, self.remote_credentials.as_ref()?)
+            .then_some(active.tuple())
+    }
+
+    fn consent_slots(&self) -> usize {
+        let retained = self.current_consent_tuple().is_some_and(|tuple| {
+            !self.retired.contains(&tuple)
+                && !self
+                    .candidate_pairs
+                    .iter()
+                    .any(|pair| self.pair_tuple(pair) == tuple)
+        });
+        self.candidate_pairs.len() + self.retired.len() + usize::from(retained)
+    }
+
+    fn retire_tuple(&mut self, tuple: Tuple) {
+        if self.retired_credentials.is_none() {
+            self.retired_credentials = self
+                .remote_credentials
+                .as_ref()
+                .map(|remote| (self.local_credentials.clone(), remote.clone()));
+        }
+        self.candidate_pairs.retain(|pair| {
+            let local = pair.local_candidate(&self.local_candidates);
+            (
+                local.proto(),
+                local.base(),
+                pair.remote_candidate(&self.remote_candidates).addr(),
+            ) != tuple
+        });
+        self.retired.insert(tuple);
+        self.transmit
+            .retain(|packet| (packet.proto, packet.source, packet.destination) != tuple);
+    }
+
+    fn reset_retired_generation(&mut self) {
+        if self
+            .retired_credentials
+            .as_ref()
+            .is_some_and(|(local, remote)| {
+                local != &self.local_credentials
+                    || self
+                        .remote_credentials
+                        .as_ref()
+                        .is_some_and(|current| current != remote)
+            })
+        {
+            self.retired.clear();
+            self.retired_credentials = None;
+        }
+    }
+
+    fn retire_active(&mut self, tuple: Tuple) {
+        if self.current_consent_tuple() == Some(tuple) {
+            self.retire_tuple(tuple);
+        }
+        self.active_consent = None;
+        self.nominated_send = None;
+    }
+
+    fn expire_consents(&mut self, now: Instant) {
+        if self.ice_lite {
+            return;
+        }
+        if self
+            .active_consent
+            .as_ref()
+            .is_some_and(|active| active.expired(now))
+        {
+            let tuple = self.active_consent.as_ref().unwrap().tuple();
+            self.retire_active(tuple);
+        }
+        let selected = self.current_consent_tuple();
+        let expired: Vec<_> = self
+            .candidate_pairs
+            .iter()
+            .filter(|pair| Some(self.pair_tuple(pair)) != selected)
+            .filter(|pair| pair.last_response().is_some_and(|at| now >= at + EXPIRY))
+            .map(|pair| self.pair_tuple(pair))
+            .collect();
+        for tuple in expired {
+            self.retire_tuple(tuple);
+        }
     }
 
     fn ice_lite_nomination_timeout(&self, now: Instant) -> Option<Instant> {
@@ -1484,6 +1832,20 @@ impl IceAgent {
     }
 
     fn stun_server_handle_request(&mut self, req: StunRequest) {
+        if self
+            .retired
+            .contains(&(req.proto, req.destination, req.source))
+        {
+            return;
+        }
+        if self.consent_slots() >= self.max_candidate_pairs.unwrap_or(100)
+            && !self
+                .candidate_pairs
+                .iter()
+                .any(|pair| self.pair_tuple(pair) == (req.proto, req.destination, req.source))
+        {
+            return;
+        }
         let remote_creds = self.remote_credentials.as_ref().expect("Remote ICE creds");
         if req.remote_ufrag != remote_creds.ufrag {
             // this check can be delayed due to receiving STUN bind requests before we
@@ -1501,7 +1863,8 @@ impl IceAgent {
         // (including 487 Role Conflict) or create peer-reflexive candidates
         // for traffic that isn't actually directed at one of our interfaces.
         let local_idx = match self.local_candidates.iter().position(|v| {
-            matches!(v.kind(), CandidateKind::Host | CandidateKind::Relayed)
+            !v.discarded()
+                && matches!(v.kind(), CandidateKind::Host | CandidateKind::Relayed)
                 && v.addr() == req.destination
                 && v.proto() == req.proto
         }) {
@@ -1521,20 +1884,9 @@ impl IceAgent {
 
         // Role conflict detection: if the peer claims the same role as us,
         // the agent with the higher tiebreaker keeps its role and the loser yields.
-        if let Some(peer_tb) = req.role_conflict_tiebreaker(self.controlling) {
-            debug!(
-                "Role conflict on {} role: ours={}, peer={}",
-                role_name(self.controlling),
-                self.control_tie_breaker,
-                peer_tb,
-            );
-
-            if self.control_tie_breaker >= peer_tb {
-                self.send_role_conflict_reply(&req);
-                return;
-            }
-
-            self.switch_role(!self.controlling);
+        if self.resolve_role_conflict(req.role_conflict_tiebreaker(self.controlling)) {
+            self.send_role_conflict_reply(&req);
+            return;
         }
 
         if req.use_candidate && self.controlling {
@@ -1840,36 +2192,46 @@ impl IceAgent {
         let Some((code, _)) = message.error_code() else {
             return;
         };
+        let Some(index) = self
+            .candidate_pairs
+            .iter()
+            .position(|pair| pair.binding_attempt(message.trans_id()).is_some())
+        else {
+            return;
+        };
+        let tuple = self.pair_tuple(&self.candidate_pairs[index]);
+        let attempt = self.candidate_pairs[index]
+            .take_failed_attempt(message.trans_id())
+            .unwrap();
+        if code == 403 {
+            if self.current_consent_tuple() == Some(tuple) {
+                self.retire_active(tuple);
+            } else {
+                self.retire_tuple(tuple);
+            }
+            return;
+        }
         if code != 487 {
             debug!("Ignoring binding error response with code {code}");
             return;
         }
 
-        let trans_id = message.trans_id();
-        let attempt = self
-            .candidate_pairs
-            .iter()
-            .find_map(|p| p.binding_attempt(trans_id));
+        self.handle_role_conflict_response(attempt.controlling());
+    }
 
-        let Some(attempt) = attempt else {
-            debug!("Ignore 487 for unknown transaction id");
-            return;
-        };
-
-        if attempt.controlling() != self.controlling {
-            debug!(
-                "Ignore stale 487 (request was sent as {}, we are now {})",
-                role_name(attempt.controlling()),
-                role_name(self.controlling),
-            );
-            return;
+    fn handle_role_conflict_response(&mut self, role: bool) {
+        if role == self.controlling {
+            self.switch_role(!self.controlling);
         }
+    }
 
-        debug!(
-            "Got 487 Role Conflict, switching from {}",
-            role_name(self.controlling),
-        );
+    fn resolve_role_conflict(&mut self, peer: Option<u64>) -> bool {
+        let Some(peer) = peer else { return false };
+        if self.control_tie_breaker >= peer {
+            return true;
+        }
         self.switch_role(!self.controlling);
+        false
     }
 
     fn stun_client_handle_response(&mut self, now: Instant, message: StunMessage<'_>) {
@@ -1969,7 +2331,16 @@ impl IceAgent {
             (pair, idx)
         };
 
-        pair.record_binding_response(now, trans_id, valid_idx);
+        let refreshed = pair.record_binding_response(now, trans_id, valid_idx);
+        if refreshed && Some(pair.id()) == self.nominated_send {
+            if let (Some(active), Some(remote)) =
+                (&mut self.active_consent, &self.remote_credentials)
+            {
+                if active.same_generation(&self.local_credentials, remote) {
+                    active.renew(now);
+                }
+            }
+        }
 
         // For a controlled agent, a successful check can make a nominated pair valid.
         self.evaluate_nomination(now);
@@ -1984,14 +2355,20 @@ impl IceAgent {
             return;
         }
 
-        let nominated_pair_priority = self.nominated_pair_priority();
+        let nominated_pair_priority = self
+            .nominated_pair()
+            .filter(|pair| pair.is_still_possible(now, &self.timing_config))
+            .map(|pair| pair.prio());
 
         let best_prio = if self.controlling {
             // For controlling agents, we pick the best candidate pair using
             // this strategy.
             self.candidate_pairs
                 .iter_mut()
-                .filter(|p| p.state() == CheckState::Succeeded)
+                .filter(|p| {
+                    p.state() == CheckState::Succeeded
+                        && p.is_still_possible(now, &self.timing_config)
+                })
                 .max_by_key(|p| p.prio())
         } else {
             // For controlled agents, we pick the best pair from what the controlling
@@ -2001,7 +2378,11 @@ impl IceAgent {
             // never becomes the send path.
             self.candidate_pairs
                 .iter_mut()
-                .filter(|p| p.is_nominated() && p.state() == CheckState::Succeeded)
+                .filter(|p| {
+                    p.is_nominated()
+                        && p.state() == CheckState::Succeeded
+                        && p.is_still_possible(now, &self.timing_config)
+                })
                 .max_by_key(|p| p.prio())
         };
 
@@ -2026,7 +2407,7 @@ impl IceAgent {
 
             let id = best_prio.id();
             let (proto, source, destination) = (local.proto(), local.base(), remote.addr());
-            self.set_nominated_send(id, proto, source, destination);
+            self.set_nominated_send(now, id, proto, source, destination);
         }
     }
 
@@ -2064,30 +2445,58 @@ impl IceAgent {
 
         let local = best.local_candidate(&self.local_candidates);
         let remote = best.remote_candidate(&self.remote_candidates);
-        self.set_nominated_send(best.id(), local.proto(), local.base(), remote.addr());
+        self.set_nominated_send(now, best.id(), local.proto(), local.base(), remote.addr());
     }
 
     fn set_nominated_send(
         &mut self,
+        now: Instant,
         id: PairId,
         proto: Protocol,
         source: SocketAddr,
         destination: SocketAddr,
     ) {
+        let remote_creds = self
+            .remote_credentials
+            .as_ref()
+            .expect("nominated remote credentials");
+        let same = self.active_consent.as_ref().is_some_and(|active| {
+            active.matches(proto, source, destination)
+                && active.same_generation(&self.local_credentials, remote_creds)
+        });
+        if !same {
+            let pair = self
+                .candidate_pairs
+                .iter()
+                .find(|pair| pair.id() == id)
+                .expect("nominated pair");
+            let validated = pair.last_response().unwrap_or(now); // ICE-lite is a responder.
+            self.active_consent = Some(ActiveConsent::new(
+                pair.local_candidate(&self.local_candidates),
+                pair.remote_candidate(&self.remote_candidates),
+                self.local_credentials.clone(),
+                remote_creds.clone(),
+                validated,
+                self.ice_lite,
+            ));
+        }
+        if let Some(active) = self.active_consent.as_mut() {
+            active.withdrawn = false;
+            if let Some(at) = self
+                .candidate_pairs
+                .iter()
+                .find(|pair| pair.id() == id)
+                .and_then(|pair| pair.last_response())
+            {
+                active.renew(at);
+            }
+        }
         self.nominated_send = Some(id);
         self.emit_event(IceAgentEvent::NominatedSend {
             proto,
             source,
             destination,
         });
-    }
-
-    fn nominated_pair_priority(&self) -> Option<u64> {
-        let id = self.nominated_send?;
-
-        self.candidate_pairs
-            .iter()
-            .find_map(|p| (p.id() == id).then_some(p.prio()))
     }
 
     fn nominated_pair(&self) -> Option<&CandidatePair> {
@@ -2149,14 +2558,21 @@ impl IceAgent {
     fn evaluate_state(&mut self, now: Instant) {
         use IceConnectionState::*;
 
-        let mut any_nomination = false;
+        let mut any_nomination = !self.ice_lite
+            && self
+                .active_consent
+                .as_ref()
+                .is_some_and(|active| active.viable(now, &self.timing_config));
         let mut any_still_possible = false;
 
         for p in &self.candidate_pairs {
             // A nominated pair counts once it is valid (RFC 8445 §8.1.1), which is
             // also when `evaluate_nomination` can make it the send path. Until then
             // it is just another pair being checked.
-            if p.is_nominated() && p.state() == CheckState::Succeeded {
+            if p.is_nominated()
+                && p.state() == CheckState::Succeeded
+                && (self.ice_lite || p.is_still_possible(now, &self.timing_config))
+            {
                 any_nomination = true;
             } else if p.is_still_possible(now, &self.timing_config) {
                 any_still_possible = true;

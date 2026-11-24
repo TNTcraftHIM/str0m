@@ -1880,6 +1880,14 @@ impl Rtc {
                 .or_else(|| self.session.poll_datagram(self.last_now));
 
             if let Some(contents) = datagram {
+                if !self
+                    .ice
+                    .can_send(self.last_now, send.proto, send.source, send.destination)
+                {
+                    // Treat an unavailable transport like a dropped datagram. Existing
+                    // RTP/SCTP/DTLS owners keep their normal realtime/reliability policy.
+                    return Ok(None);
+                }
                 let t = net::Transmit {
                     proto: send.proto,
                     source: send.source,

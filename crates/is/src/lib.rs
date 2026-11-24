@@ -105,6 +105,9 @@ pub use agent::{IceAgent, IceAgentEvent, IceConnectionState, IceCreds, LocalPref
 mod candidate;
 pub use candidate::{Candidate, CandidateBuilder, CandidateKind};
 
+mod consent;
+#[cfg(test)]
+mod consent_tests;
 mod pair;
 
 mod preference;
@@ -232,27 +235,16 @@ pub(crate) mod test {
         let (d, e) = a2.events.last().unwrap();
         assert_last_event(d, e, &a2);
 
-        assert_eq!(
-            a1.stats(),
-            IceAgentStats {
-                bind_request_sent: 11,
-                bind_success_recv: 2,
-                bind_request_recv: 11,
-                discovered_recv_count: 1,
-                nomination_send_count: 1,
-            }
-        );
-
-        assert_eq!(
-            a2.stats(),
-            IceAgentStats {
-                bind_request_sent: 11,
-                bind_success_recv: 2,
-                bind_request_recv: 2,
-                discovered_recv_count: 1,
-                nomination_send_count: 1,
-            }
-        );
+        // Established consent checks are randomized independently from discovery RTO.
+        // Keep the observable disconnect and accounting contracts, not one packet count.
+        for agent in [&a1, &a2] {
+            let stats = agent.stats();
+            assert!(stats.bind_request_sent > 0);
+            assert!(stats.bind_request_recv > 0);
+            assert_eq!(stats.bind_success_recv, 2);
+            assert_eq!(stats.discovered_recv_count, 1);
+            assert_eq!(stats.nomination_send_count, 1);
+        }
     }
 
     #[test]
@@ -1066,36 +1058,17 @@ pub(crate) mod test {
         a1.set_controlling(true);
         a2.set_controlling(false);
 
-        // loop until we're connected.
-        loop {
-            if a1.state().is_connected() && a2.state().is_connected() {
-                break;
-            }
-            progress(&mut a1, &mut a2);
-        }
-
-        // Move to "idle" mode
+        // Discovery pacing stays configurable before a tuple is established.
+        a1.set_remote_credentials(a2.local_credentials().clone());
         a1.set_initial_stun_rto(IDLE_RTO);
         a1.set_max_stun_rto(IDLE_RTO);
-        a2.set_initial_stun_rto(IDLE_RTO);
-        a2.set_max_stun_rto(IDLE_RTO);
-
-        // Spin for a bit
-        for _ in 0..10 {
-            progress(&mut a1, &mut a2);
-        }
-
-        // This is a bit of a hack because we use "insider" knowledge here
-        // that the next timeout is in fact `IDLE_RTO` away.
-        let now = a1.poll_timeout().unwrap() - IDLE_RTO;
-
+        let now = a1.start_time;
+        a1.handle_timeout(now);
+        while a1.poll_transmit().is_some() {}
+        assert_eq!(a1.poll_timeout(), Some(now + IDLE_RTO));
         a1.set_initial_stun_rto(NORMAL_RTO);
         a1.set_max_stun_rto(NORMAL_RTO);
-
-        let timeout_after = a1.poll_timeout().unwrap();
-
-        // After applying the new timeout, it should only be `NORMAL_RTO` away.
-        assert_eq!(timeout_after, now + NORMAL_RTO);
+        assert_eq!(a1.poll_timeout(), Some(now + NORMAL_RTO));
     }
 
     #[test]
