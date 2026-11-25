@@ -1429,6 +1429,16 @@ impl Rtc {
         self.ice.state().is_connected() && self.dtls_connected && self.session.is_connected()
     }
 
+    /// Returns whether the live RTC has ICE send consent on its selected path.
+    /// Uses the last processed SDK time. DTLS and channel readiness are separate.
+    pub fn has_send_consent(&self) -> bool {
+        self.is_alive()
+            && self.send_addr.as_ref().is_some_and(|send| {
+                self.ice
+                    .can_send(self.last_now, send.proto, send.source, send.destination)
+            })
+    }
+
     /// Make changes to the Rtc session via SDP.
     ///
     /// ```no_run
